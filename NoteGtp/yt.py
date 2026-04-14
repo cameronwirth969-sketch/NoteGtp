@@ -1,33 +1,86 @@
-# app.py - YouTube Transcript Extractor with Invidious Fallback
-# ✅ Works locally (official API) AND on cloud hosts (Invidious fallback)
-# ✅ 100% free, no proxies, no auth
+# app.py - YouTube Transcript Extractor (Robust Invidious Fallback)
+# ✅ Handles 404s, HTML responses, instance failures gracefully
+# ✅ Correct Invidious API endpoint usage
 
 import os
 import re
 import logging
 import requests
-from flask import Flask, request, render_template_string, jsonify
+from flask import Flask, request, render_template_string
 from youtube_transcript_api import YouTubeTranscriptApi, RequestBlocked
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 # =============================================================================
-# INVIDIOUS INSTANCES (public, free, CORS-enabled)
+# INVIDIOUS: Reliable instances + correct API usage
 # =============================================================================
+# Test these instances: https://instances.invidious.io (look for "API: ✅")
 INVIDIOUS_INSTANCES = [
-    "https://inv.nadeko.net",
-    "https://invidious.snopyta.org",
-    "https://yewtu.be",
-    "https://invidious.fdn.fr",
-    "https://inv.tux.pizza",
-    "https://vid.puffyan.us",
+    "https://yewtu.be",           # Very reliable, US
+    "https://inv.nadeko.net",     # EU, stable
+    "https://invidious.fdn.fr",   # France, good uptime
+    "https://inv.tux.pizza",      # US, fast
+    "https://vid.puffyan.us",     # US, reliable
+    "https://invidious.slipfox.xyz", # US, backup
 ]
 
+def fetch_via_invidious(video_id, language=None):
+    """
+    Fetch transcript via Invidious API.
+    Endpoint: GET /api/v1/captions/{video_id}/{lang}
+    Returns: plain text transcript or None if failed
+    """
+    # Language codes to try (Invidious uses standard codes)
+    languages = []
+    if language:
+        languages.append(language)
+    # Fallbacks
+    languages.extend(['en', 'en-US', 'en-GB'])
+    
+    for instance in INVIDIOUS_INSTANCES:
+        for lang in languages:
+            try:
+                # ✅ Correct endpoint: /api/v1/captions/{video_id}/{lang}
+                url = f"{instance}/api/v1/captions/{video_id}/{lang}"
+                headers = {
+                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                resp = requests.get(url, headers=headers, timeout=12)
+                
+                # ✅ Check status BEFORE parsing JSON
+                if resp.status_code == 404:
+                    continue  # No captions in this language on this instance
+                if resp.status_code != 200:
+                    continue  # Server error, try next
+                
+                # ✅ Only parse JSON if we got 200 OK
+                try:
+                    data = resp.json()
+                except ValueError:
+                    continue  # Not JSON, skip
+                
+                # Invidious returns: [{"text": "...", "start": 0.0, "dur": 1.5}, ...]
+                if isinstance(data, list) and len(data) > 0 and 'text' in data[0]:
+                    text_lines = [item['text'] for item in data if isinstance(item, dict) and 'text' in item]
+                    if text_lines:
+                        logger.info(f"✅ Invidious success: {instance} ({lang})")
+                        return "\n".join(text_lines)
+                        
+            except requests.RequestException:
+                continue  # Network error, try next instance/lang
+            except Exception:
+                continue  # Any other error, keep trying
+    
+    logger.warning(f"⚠️ Invidious fallback failed for {video_id}")
+    return None
+
 # =============================================================================
-# FRONTEND
+# FRONTEND (minimal, clean)
 # =============================================================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -38,30 +91,24 @@ HTML_TEMPLATE = """
     <title>YouTube Transcript Extractor</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-            max-width: 800px; margin: 2rem auto; padding: 0 1rem; 
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
-            color: #e6e6e6; min-height: 100vh;
-        }
-        .card { background: #0f3460; padding: 2rem; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); border: 1px solid #1a4780; }
-        h1 { margin: 0 0 1.5rem; font-size: 1.8rem; text-align: center; color: #fff; }
-        label { display: block; margin: 1rem 0 0.5rem; font-weight: 600; color: #c5c5c5; }
-        input, select { width: 100%; padding: 0.85rem; border: 2px solid #1a4780; border-radius: 8px; font-size: 1rem; background: #0a1929; color: #fff; }
-        input:focus, select:focus { outline: none; border-color: #4ecca3; }
-        button { width: 100%; margin-top: 1.5rem; padding: 1rem; background: linear-gradient(135deg, #4ecca3 0%, #45b393 100%); color: #0a1929; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
-        button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(78,204,163,0.4); }
-        #result { margin-top: 1.5rem; padding: 1.25rem; background: #0a1929; border: 1px solid #1a4780; border-radius: 10px; white-space: pre-wrap; line-height: 1.7; min-height: 80px; display: none; font-size: 0.95rem; }
-        .error { color: #ff6b6b; font-weight: 500; }
-        .loader { display: none; margin-top: 1rem; text-align: center; font-style: italic; color: #aaa; }
-        .copy-btn { margin-top: 0.75rem; padding: 0.5rem 1rem; background: #10b981; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; display: none; width: auto; }
-        .footer { text-align: center; margin-top: 2rem; color: rgba(255,255,255,0.7); font-size: 0.85rem; }
-        .badge { display: inline-block; padding: 0.25rem 0.5rem; background: #4ecca3; color: #0a1929; border-radius: 4px; font-size: 0.75rem; font-weight: 600; margin-left: 0.5rem; }
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; background: #f8fafc; color: #1e293b; }
+        .card { background: #fff; padding: 2rem; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        h1 { margin: 0 0 1.5rem; font-size: 1.6rem; text-align: center; }
+        label { display: block; margin: 1rem 0 0.5rem; font-weight: 600; }
+        input, select { width: 100%; padding: 0.85rem; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 1rem; }
+        input:focus, select:focus { outline: none; border-color: #3b82f6; }
+        button { width: 100%; margin-top: 1.5rem; padding: 1rem; background: #3b82f6; color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+        button:hover { background: #2563eb; }
+        #result { margin-top: 1.5rem; padding: 1.25rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; white-space: pre-wrap; line-height: 1.7; min-height: 80px; display: none; }
+        .error { color: #dc2626; font-weight: 500; }
+        .loader { display: none; margin-top: 1rem; text-align: center; color: #64748b; }
+        .copy-btn { margin-top: 0.75rem; padding: 0.5rem 1rem; background: #10b981; color: white; border: none; border-radius: 6px; cursor: pointer; display: none; width: auto; }
+        .footer { text-align: center; margin-top: 2rem; color: #64748b; font-size: 0.85rem; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>📺 YouTube Transcript Extractor <span class="badge">FREE</span></h1>
+        <h1>📺 YouTube Transcript Extractor</h1>
         <form id="form">
             <label for="url">YouTube URL or Video ID</label>
             <input type="text" id="url" placeholder="https://youtu.be/jNQXAC9IVRw" value="https://youtu.be/jNQXAC9IVRw" required>
@@ -83,9 +130,7 @@ HTML_TEMPLATE = """
         <div id="result"></div>
         <button class="copy-btn" id="copyBtn" onclick="copyText()">📋 Copy to Clipboard</button>
     </div>
-    <div class="footer">
-        Built with Flask • Uses <a href="https://github.com/iv-org/invidious" target="_blank">Invidious</a> fallback for cloud hosting
-    </div>
+    <div class="footer">Free • No login • Works on cloud hosts</div>
     <script>
         document.getElementById('form').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -103,6 +148,12 @@ HTML_TEMPLATE = """
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url, language })
                 });
+                // ✅ Handle non-JSON responses safely
+                const contentType = res.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    const text = await res.text();
+                    throw new Error(`Server returned ${res.status}: ${text.substring(0, 100)}`);
+                }
                 const data = await res.json();
                 resultDiv.style.display = 'block';
                 copyBtn.style.display = 'block';
@@ -114,7 +165,7 @@ HTML_TEMPLATE = """
                 }
             } catch (err) {
                 resultDiv.style.display = 'block';
-                resultDiv.innerHTML = `<span class="error">❌ Network error: ${err.message}</span>`;
+                resultDiv.innerHTML = `<span class="error">❌ ${err.message}</span>`;
                 copyBtn.style.display = 'none';
             } finally { loader.style.display = 'none'; }
         });
@@ -133,7 +184,7 @@ HTML_TEMPLATE = """
 """
 
 # =============================================================================
-# BACKEND
+# BACKEND ROUTES
 # =============================================================================
 
 def extract_video_id(url):
@@ -145,27 +196,6 @@ def extract_video_id(url):
         match = re.search(pattern, url)
         if match:
             return match.group(1)
-    return None
-
-def fetch_via_invidious(video_id, language=None):
-    """Fetch transcript via Invidious API fallback."""
-    languages = [language, 'en'] if language else ['en', 'en-US', 'en-GB']
-    
-    for instance in INVIDIOUS_INSTANCES:
-        for lang in languages:
-            try:
-                url = f"{instance}/api/v1/captions/{video_id}"
-                params = {'lang': lang} if lang else {}
-                headers = {'Accept': 'application/json'}
-                
-                resp = requests.get(url, params=params, headers=headers, timeout=15)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    # Invidious returns list of {text, start, dur}
-                    if isinstance(data, list) and len(data) > 0:
-                        return "\n".join([item['text'] for item in data if 'text' in item])
-            except Exception:
-                continue  # Try next instance/language
     return None
 
 @app.route('/')
@@ -183,37 +213,36 @@ def extract():
         if not video_id or len(video_id) != 11:
             return {'success': False, 'error': 'Invalid YouTube URL or Video ID'}, 400
 
-        # 🎯 STRATEGY 1: Try official API first (works locally)
+        # 🎯 STRATEGY 1: Official YouTube API (works on residential IPs)
         try:
-            logger.info(f"🔹 Trying official YouTube API for {video_id}")
+            logger.info(f"🔹 Trying official API for {video_id}")
             ytt_api = YouTubeTranscriptApi()
-            languages = [language, 'en'] if language else ['en']
-            fetched = ytt_api.fetch(video_id, languages=languages)
+            langs = [language, 'en'] if language else ['en']
+            fetched = ytt_api.fetch(video_id, languages=langs)
             text = "\n".join([s.text for s in fetched])
-            logger.info(f"✅ Official API succeeded: {len(fetched)} snippets")
+            logger.info(f"✅ Official API: {len(fetched)} snippets")
             return {'success': True, 'transcript': text}
         except RequestBlocked:
-            logger.info(f"⚠️ Official API blocked (cloud IP), falling back to Invidious...")
+            logger.info(f"⚠️ Official API blocked (cloud IP), trying Invidious...")
         except Exception as e:
-            logger.warning(f"⚠️ Official API failed: {e}, trying fallback...")
+            logger.warning(f"⚠️ Official API error: {type(e).__name__}, trying fallback...")
 
-        # 🎯 STRATEGY 2: Invidious fallback (works on cloud hosts)
+        # 🎯 STRATEGY 2: Invidious fallback (works on cloud IPs)
         logger.info(f"🔹 Trying Invidious fallback for {video_id}")
         text = fetch_via_invidious(video_id, language)
         
         if text:
-            logger.info(f"✅ Invidious fallback succeeded")
             return {'success': True, 'transcript': text}
         
         # ❌ All methods failed
         return {
             'success': False,
-            'error': "Could not fetch transcript. This video may have captions disabled, or all services are temporarily unavailable. Try again later or test locally."
+            'error': "Could not fetch transcript. Possible reasons:\n• Video has no captions enabled\n• All services temporarily unavailable\n• Video is age-restricted or region-blocked\n\nTry a different video or test locally."
         }, 503
 
     except Exception as e:
-        logger.error(f"💥 Unexpected error: {e}", exc_info=True)
-        return {'success': False, 'error': f"Server error: {str(e)}"}, 500
+        logger.error(f"💥 Server error: {e}", exc_info=True)
+        return {'success': False, 'error': f"Internal error: {str(e)}"}, 500
 
 # =============================================================================
 # ENTRY POINT
